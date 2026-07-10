@@ -456,12 +456,22 @@ class SunoApi {
    */
   public async browserGenerate(
     prompt: string,
-    make_instrumental: boolean = false
+    make_instrumental: boolean = false,
+    tags?: string
   ): Promise<AudioInfo[]> {
     await this.keepAlive(false);
     const context = await this.launchBrowser();
     try {
       const page = await context.newPage();
+      // Selectors for the redesigned create page. description/createBtn are confirmed
+      // (AUTOMATION_LOG); advancedToggle + styles need a live confirmation pass —
+      // adjust these constants if Suno changes the UI.
+      const SEL = {
+        description: 'textarea[maxlength="3000"]',
+        styles: 'textarea[maxlength="1000"]',
+        createBtn: 'button[aria-label="Create song"]',
+        advancedToggle: 'button:has-text("Advanced")',
+      };
       let clips: any[] | null = null;
       page.on('response', async (resp) => {
         const u = resp.url();
@@ -490,10 +500,31 @@ class SunoApi {
         await sleep(0.5);
       }
 
-      const textarea = page.locator('textarea[maxlength="3000"]');
+      // tags/styles: best-effort. Try Advanced mode + Styles box; on any failure,
+      // fall back to appending tags into the description (Simple mode) so generation
+      // never breaks.
+      let descriptionText = prompt;
+      const cleanTags = (tags || '').trim();
+      if (cleanTags) {
+        let stylesApplied = false;
+        try {
+          await page.locator(SEL.advancedToggle).first().click({ timeout: 3000 }).catch(() => {});
+          await sleep(0.5);
+          const stylesBox = page.locator(SEL.styles).first();
+          await stylesBox.waitFor({ state: 'visible', timeout: 3000 });
+          await stylesBox.click();
+          await stylesBox.fill(cleanTags);
+          stylesApplied = true;
+          logger.info('browserGenerate: tags applied to Styles box: ' + cleanTags);
+        } catch (e: any) {
+          logger.info('browserGenerate: Styles unavailable, appending tags to description');
+        }
+        if (!stylesApplied) descriptionText = `${prompt} (${cleanTags})`;
+      }
+      const textarea = page.locator(SEL.description);
       await textarea.click();
-      await textarea.fill(prompt);
-      const button = page.locator('button[aria-label="Create song"]');
+      await textarea.fill(descriptionText);
+      const button = page.locator(SEL.createBtn);
       for (let i = 0; i < 40; i++) {
         if (!(await button.isDisabled().catch(() => true))) break;
         await sleep(0.25);
@@ -599,7 +630,8 @@ class SunoApi {
     prompt: string,
     make_instrumental: boolean = false,
     model?: string,
-    wait_audio: boolean = false
+    wait_audio: boolean = false,
+    tags?: string
   ): Promise<AudioInfo[]> {
     await this.keepAlive(false);
     const startTime = Date.now();
@@ -609,7 +641,7 @@ class SunoApi {
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         logger.info('generate: attempt ' + attempt);
-        result = await this.browserGenerate(prompt, make_instrumental);
+        result = await this.browserGenerate(prompt, make_instrumental, tags);
         break;
       } catch (e: any) {
         logger.info('generate: attempt ' + attempt + ' failed: ' + e.message);
