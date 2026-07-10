@@ -29,6 +29,9 @@ yarn-error.log*
 .env*.local
 .env
 
+# runtime captcha spend stats
+/data
+
 # vercel
 .vercel
 

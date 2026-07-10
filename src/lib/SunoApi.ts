@@ -11,6 +11,7 @@ import { BrowserContext, Page, Locator, chromium, firefox } from 'rebrowser-play
 import { createCursor, Cursor } from 'ghost-cursor-playwright';
 import { promises as fs } from 'fs';
 import path from 'node:path';
+import { recordSolve, recordBadReport } from '@/lib/captchaStats';
 
 // sunoApi instance caching
 const globalForSunoApi = global as unknown as { sunoApiCache?: Map<string, SunoApi> };
@@ -326,11 +327,11 @@ class SunoApi {
       // await this.click(page, { x: 318, y: 13 });
     } catch(e) {}
 
-    const textarea = page.locator('.custom-textarea');
+    const textarea = page.locator('textarea[maxlength="3000"]');
     await this.click(textarea);
     await textarea.pressSequentially('Lorem ipsum', { delay: 80 });
 
-    const button = page.locator('button[aria-label="Create"]').locator('div.flex');
+    const button = page.locator('button[aria-label="Create song"]');
     this.click(button);
 
     const controller = new AbortController();
@@ -357,6 +358,7 @@ class SunoApi {
                 payload.imginstructions = (await fs.readFile(path.join(process.cwd(), 'public', 'drag-instructions.jpg'))).toString('base64');
               }
               captcha = await this.solver.coordinates(payload);
+              await recordSolve(); // one successful image solve = one 2Captcha charge
               break;
             } catch(err: any) {
               logger.info(err.message);
@@ -373,6 +375,7 @@ class SunoApi {
             if (captcha.data.length % 2) {
               logger.info('Solution does not have even amount of points required for dragging. Requesting new solution...');
               this.solver.badReport(captcha.id);
+              recordBadReport(); // bad-reported solves are refunded, excluded from spend
               wait = false;
               continue;
             }
@@ -439,6 +442,153 @@ class SunoApi {
   }
 
   /**
+   * Browser-driven generation (strategy C). Drives the real suno.com/create page,
+   * types the prompt, clicks Create, and captures the clips from the
+   * /api/generate/v2-web/ response. hCaptcha usually passes passively; if a
+   * challenge appears it is best-effort solved via 2Captcha.
+   *
+   * This replaces the old axios token-replay path (generateSongs/getCaptcha),
+   * which broke when Suno moved generation to /api/generate/v2-web/ and
+   * redesigned the create page.
+   * @param prompt The text prompt to generate audio from.
+   * @param make_instrumental Indicates if the generated audio should be instrumental.
+   * @returns A promise that resolves to an array of AudioInfo objects.
+   */
+  public async browserGenerate(
+    prompt: string,
+    make_instrumental: boolean = false
+  ): Promise<AudioInfo[]> {
+    await this.keepAlive(false);
+    const context = await this.launchBrowser();
+    try {
+      const page = await context.newPage();
+      let clips: any[] | null = null;
+      page.on('response', async (resp) => {
+        const u = resp.url();
+        if (u.includes('/api/generate/v2') && resp.request().method() === 'POST') {
+          try {
+            const j = await resp.json();
+            clips = j.clips || j;
+            logger.info('browserGenerate: /api/generate fired');
+          } catch (e) {}
+        }
+      });
+
+      await page.goto('https://suno.com/create', {
+        referer: 'https://www.google.com/',
+        waitUntil: 'domcontentloaded',
+        timeout: 0,
+      });
+      await page.waitForResponse('**/api/project/**\\?**', { timeout: 60000 });
+      await sleep(2, 3);
+
+      if (make_instrumental) {
+        await page
+          .locator('button[aria-label="Check this to generate an instrumental only song"]')
+          .click()
+          .catch(() => {});
+        await sleep(0.5);
+      }
+
+      const textarea = page.locator('textarea[maxlength="3000"]');
+      await textarea.click();
+      await textarea.fill(prompt);
+      const button = page.locator('button[aria-label="Create song"]');
+      for (let i = 0; i < 40; i++) {
+        if (!(await button.isDisabled().catch(() => true))) break;
+        await sleep(0.25);
+      }
+      await sleep(0.5, 0.8);
+      await button.click();
+      logger.info('browserGenerate: clicked Create song');
+
+      const frame: any = page.frameLocator('iframe[title*="hCaptcha"]');
+      const deadline = Date.now() + 130000;
+      while (Date.now() < deadline && !clips) {
+        let hasChallenge = false;
+        try {
+          await frame.locator('.challenge-container').waitFor({ timeout: 1200 });
+          hasChallenge = true;
+        } catch (e) {}
+        if (hasChallenge) {
+          logger.info('browserGenerate: hCaptcha challenge — attempting solve');
+          const solved = await this.solveHCaptcha(frame).catch((e: any) => {
+            logger.info('browserGenerate: solve error: ' + e.message);
+            return false;
+          });
+          if (!solved) throw new Error('hCaptcha challenge did not clear');
+          await sleep(2);
+        } else {
+          await sleep(1, 1.2);
+        }
+      }
+      // `clips` is assigned inside a response callback, which TS control-flow
+      // analysis cannot see (it assumes clips stays null). Use an explicit cast
+      // so the non-null value after the throw is usable.
+      if (!clips) throw new Error('Generation timed out: no /api/generate within 130s');
+
+      return (clips as any[]).map((audio: any) => ({
+        id: audio.id,
+        title: audio.title,
+        image_url: audio.image_url,
+        lyric: audio.metadata?.prompt,
+        audio_url: audio.audio_url,
+        video_url: audio.video_url,
+        created_at: audio.created_at,
+        model_name: audio.model_name,
+        status: audio.status,
+        gpt_description_prompt: audio.metadata?.gpt_description_prompt,
+        prompt: audio.metadata?.prompt,
+        type: audio.metadata?.type,
+        tags: audio.metadata?.tags,
+        negative_tags: audio.metadata?.negative_tags,
+        duration: audio.metadata?.duration,
+      }));
+    } finally {
+      await context.browser()?.close();
+    }
+  }
+
+  /**
+   * Best-effort multi-round hCaptcha solve via 2Captcha coordinates.
+   * @param frame The hCaptcha iframe frame locator.
+   * @returns true if the challenge cleared, false otherwise.
+   */
+  private async solveHCaptcha(frame: any): Promise<boolean> {
+    const challenge = frame.locator('.challenge-container');
+    for (let round = 0; round < 4; round++) {
+      await sleep(1.5);
+      const shot = await challenge.screenshot({ timeout: 5000 }).catch(() => null);
+      if (!shot) return false;
+      let captcha: any;
+      try {
+        captcha = await this.solver.coordinates({
+          body: shot.toString('base64'),
+          lang: process.env.BROWSER_LOCALE || 'en',
+        });
+      } catch (e: any) {
+        logger.info('solveHCaptcha: 2Captcha error: ' + e.message);
+        return false;
+      }
+      logger.info(
+        'solveHCaptcha: round ' + round + ' got ' + (captcha.data || []).length + ' points'
+      );
+      for (const d of captcha.data || [])
+        await challenge.click({ position: { x: +d.x, y: +d.y } }).catch(() => {});
+      await frame.locator('.button-submit').click().catch(() => {});
+      await sleep(3.5);
+      let still = false;
+      try {
+        still = await challenge.isVisible({ timeout: 1200 });
+      } catch (e) {
+        still = false;
+      }
+      if (!still) return true;
+    }
+    return false;
+  }
+
+  /**
    * Generate a song based on the prompt.
    * @param prompt The text prompt to generate audio from.
    * @param make_instrumental Indicates if the generated audio should be instrumental.
@@ -453,19 +603,38 @@ class SunoApi {
   ): Promise<AudioInfo[]> {
     await this.keepAlive(false);
     const startTime = Date.now();
-    const audios = await this.generateSongs(
-      prompt,
-      false,
-      undefined,
-      undefined,
-      make_instrumental,
-      model,
-      wait_audio
-    );
+    // Retry: captcha is intermittently required and 2Captcha can have transient
+    // errors, so a fresh attempt often hits a passive (no-challenge) window.
+    let result: AudioInfo[] = [];
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        logger.info('generate: attempt ' + attempt);
+        result = await this.browserGenerate(prompt, make_instrumental);
+        break;
+      } catch (e: any) {
+        logger.info('generate: attempt ' + attempt + ' failed: ' + e.message);
+        if (attempt === 3) throw e;
+        await sleep(3);
+      }
+    }
+    if (wait_audio) {
+      const ids = result.map((a) => a.id);
+      await sleep(5);
+      const deadline = Date.now() + 100000;
+      while (Date.now() < deadline) {
+        const r = await this.get(ids);
+        if (r.length && r.every((a) => ['streaming', 'complete', 'error'].includes(a.status))) {
+          result = r;
+          break;
+        }
+        result = r;
+        await sleep(3, 6);
+      }
+    }
     const costTime = Date.now() - startTime;
-    logger.info('Generate Response:\n' + JSON.stringify(audios, null, 2));
+    logger.info('Generate Response:\n' + JSON.stringify(result, null, 2));
     logger.info('Cost time: ' + costTime);
-    return audios;
+    return result;
   }
 
   /**

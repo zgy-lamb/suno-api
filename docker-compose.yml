@@ -8,6 +8,7 @@ services:
         SUNO_COOKIE: ${SUNO_COOKIE}
     volumes:
       - ./public:/app/public
+      - ./data:/app/data
     ports:
       - "3000:3000"
     env_file: ".env"

@@ -37,7 +37,9 @@ export const isPage = (target: any): target is Page => {
  */
 export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> => {
   return new Promise((resolve, reject) => {
-    const urlPattern = /^https:\/\/img[a-zA-Z0-9]*\.hcaptcha\.com\/.*$/;
+    // Suno now proxies hCaptcha image traffic through its own hosts
+    // (hcaptcha-imgs-prod.suno.com) instead of img*.hcaptcha.com directly.
+    const urlPattern = /^https:\/\/(img[a-z0-9]*\.hcaptcha\.com|hcaptcha-imgs[a-z0-9.-]*\.suno\.com)\//i;
     let timeoutHandle: NodeJS.Timeout | null = null;
     let activeRequestCount = 0;
     let requestOccurred = false;
