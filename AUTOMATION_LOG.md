@@ -137,3 +137,38 @@ recon2 重跑时 Suno **未弹挑战**（passive 放行），浏览器点击 Cre
 
 ### 实施建议（若仍要做）
 单机起步：1 台 VPS（16GB）+ Docker + Redis 队列 + 10 worker 容器（每个跑 `browserGenerate`）+ 住宅代理网关 + SQLite 账号池。验证 10 账号稳定后再扩到 100。优先把**"每账号 sticky 代理 + 限速"**做好——这是决定成败的关键，比解码重要得多。
+
+---
+
+## tags / Styles support (feat/tags-styles, 2026-07-10)
+
+Added optional `tags` (genre/style) plumbing so the orchestrator's type→tags
+mapping can influence output. Currently `browserGenerate` only filled the
+description (Simple mode) and ignored tags.
+
+### What changed
+- `src/app/api/generate/route.ts`: destructure `tags` from request body; pass as
+  last positional arg to `generate(...)`.
+- `src/lib/SunoApi.ts`:
+  - `generate(prompt, make_instrumental, model?, wait_audio, tags?)` — added
+    optional `tags?: string` as the LAST param; forwards to `browserGenerate`.
+  - `browserGenerate(prompt, make_instrumental, tags?)` — added optional
+    `tags?: string` 3rd param. Best-effort: clicks the Advanced toggle and fills
+    the Styles box; on ANY failure, falls back to appending `(tags)` into the
+    description (Simple mode) so generation never breaks.
+  - Added a `SEL` selector-constants block at the top of the method body so the
+    selectors are easy to adjust after live validation.
+
+### Selectors — NEED LIVE VALIDATION
+- `SEL.description` = `textarea[maxlength="3000"]` — confirmed (AUTOMATION_LOG).
+- `SEL.createBtn` = `button[aria-label="Create song"]` — confirmed.
+- `SEL.advancedToggle` = `button:has-text("Advanced")` — **BEST-GUESS**, must be
+  verified against suno.com/create (text/aria may differ).
+- `SEL.styles` = `textarea[maxlength="1000"]` — **BEST-GUESS**, must be verified
+  against suno.com/create (maxlength or element type may differ).
+
+### Fallback
+If the Advanced toggle or Styles box is not found/visible within 3s, the tags
+string is appended to the description as `(tags)`, so Simple-mode generation
+always still works. `tags` is optional everywhere (default `undefined`), so
+callers that don't pass it behave identically to before.
